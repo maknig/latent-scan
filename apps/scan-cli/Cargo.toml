@@ -1,0 +1,17 @@
+[package]
+name = "scan-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "latent-scan"
+path = "src/main.rs"
+
+[dependencies]
+scan-core.workspace = true
+scan-sane.workspace = true
+scan-profiles.workspace = true
+scan-pipeline.workspace = true
+scan-detect.workspace = true
+scan-archive.workspace = true
+clap.workspace = true

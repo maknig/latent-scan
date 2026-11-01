@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/scan-core",
+    "crates/scan-sane",
+    "crates/scan-profiles",
+    "crates/scan-pipeline",
+    "crates/scan-archive",
+    "crates/scan-detect",
+    "crates/scan-ui",
+    "apps/scan-cli",
+    "apps/scan-gui",
+]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["tiff", "png", "jpeg"] }
+tempfile = "3"
+egui = "0.31"
+eframe = "0.31"
+
+scan-core = { path = "crates/scan-core" }
+scan-sane = { path = "crates/scan-sane" }
+scan-profiles = { path = "crates/scan-profiles" }
+scan-pipeline = { path = "crates/scan-pipeline" }
+scan-archive = { path = "crates/scan-archive" }
+scan-ui = { path = "crates/scan-ui" }
+scan-detect = { path = "crates/scan-detect" }
+
+# Image handling is far too slow unoptimised; keep our own code debuggable.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

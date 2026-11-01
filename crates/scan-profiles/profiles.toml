@@ -1,0 +1,40 @@
+# Built-in scan profiles. Areas are in mm on the scanner bed.
+# NOTE: film-holder areas are approximate starting points and must be calibrated
+# against the real holder (Canon 9000F). Epson V850 entries are untested.
+
+[[profile]]
+name = "print-flatbed"
+description = "Reflective print or enlargement, full A4 bed"
+source = "flatbed"
+color = "color"
+bit_depth = 16
+dpi = 600
+area = { x = 0.0, y = 0.0, width = 216.0, height = 297.0 }
+
+[[profile]]
+name = "35mm-strip"
+description = "35mm film strip in holder (approx. area, calibrate)"
+source = "transparency"
+color = "color"
+bit_depth = 16
+dpi = 4800
+area = { x = 40.0, y = 20.0, width = 28.0, height = 160.0 }
+
+[[profile]]
+name = "35mm-strip-bw"
+description = "35mm black-and-white strip in holder (approx. area, calibrate)"
+source = "transparency"
+color = "gray"
+bit_depth = 16
+dpi = 4800
+negative = true
+area = { x = 40.0, y = 20.0, width = 28.0, height = 160.0 }
+
+[[profile]]
+name = "120-6x6"
+description = "Medium format 6x6 in holder (approx. area, calibrate)"
+source = "transparency"
+color = "color"
+bit_depth = 16
+dpi = 2400
+area = { x = 35.0, y = 20.0, width = 62.0, height = 62.0 }
