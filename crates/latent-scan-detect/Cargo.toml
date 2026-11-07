@@ -1,0 +1,7 @@
+[package]
+name = "latent-scan-detect"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+latent-scan-core.workspace = true

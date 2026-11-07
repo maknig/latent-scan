@@ -1,0 +1,9 @@
+[package]
+name = "latent-scan-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+latent-image-edit.workspace = true
+serde.workspace = true
+thiserror.workspace = true

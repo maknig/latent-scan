@@ -1,0 +1,17 @@
+[package]
+name = "latent-scan-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "latent-scan"
+path = "src/main.rs"
+
+[dependencies]
+latent-scan-core.workspace = true
+latent-scan-sane.workspace = true
+latent-scan-profiles.workspace = true
+latent-image-edit.workspace = true
+latent-scan-detect.workspace = true
+latent-scan-archive.workspace = true
+clap.workspace = true

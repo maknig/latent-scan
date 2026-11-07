@@ -1829,6 +1829,111 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
+name = "latent-image-edit"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "latent-image-edit-ui"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "image",
+ "latent-image-edit",
+ "serde",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "latent-scan-archive"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "latent-scan-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "latent-image-edit",
+ "latent-scan-archive",
+ "latent-scan-core",
+ "latent-scan-detect",
+ "latent-scan-profiles",
+ "latent-scan-sane",
+]
+
+[[package]]
+name = "latent-scan-core"
+version = "0.1.0"
+dependencies = [
+ "latent-image-edit",
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "latent-scan-detect"
+version = "0.1.0"
+dependencies = [
+ "latent-scan-core",
+]
+
+[[package]]
+name = "latent-scan-gui"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "latent-scan-ui",
+]
+
+[[package]]
+name = "latent-scan-profiles"
+version = "0.1.0"
+dependencies = [
+ "latent-scan-core",
+ "serde",
+ "thiserror 1.0.69",
+ "toml",
+]
+
+[[package]]
+name = "latent-scan-sane"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "latent-scan-core",
+ "tempfile",
+]
+
+[[package]]
+name = "latent-scan-ui"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "image",
+ "latent-image-edit",
+ "latent-image-edit-ui",
+ "latent-scan-archive",
+ "latent-scan-core",
+ "latent-scan-detect",
+ "latent-scan-profiles",
+ "latent-scan-sane",
+ "rfd",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2826,97 +2931,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "scan-archive"
-version = "0.1.0"
-dependencies = [
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "scan-cli"
-version = "0.1.0"
-dependencies = [
- "clap",
- "scan-archive",
- "scan-core",
- "scan-detect",
- "scan-pipeline",
- "scan-profiles",
- "scan-sane",
-]
-
-[[package]]
-name = "scan-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "scan-detect"
-version = "0.1.0"
-dependencies = [
- "scan-core",
-]
-
-[[package]]
-name = "scan-gui"
-version = "0.1.0"
-dependencies = [
- "eframe",
- "scan-ui",
-]
-
-[[package]]
-name = "scan-pipeline"
-version = "0.1.0"
-dependencies = [
- "image",
- "scan-core",
-]
-
-[[package]]
-name = "scan-profiles"
-version = "0.1.0"
-dependencies = [
- "scan-core",
- "serde",
- "thiserror 1.0.69",
- "toml",
-]
-
-[[package]]
-name = "scan-sane"
-version = "0.1.0"
-dependencies = [
- "image",
- "scan-core",
- "tempfile",
-]
-
-[[package]]
-name = "scan-ui"
-version = "0.1.0"
-dependencies = [
- "egui",
- "image",
- "rfd",
- "scan-archive",
- "scan-core",
- "scan-detect",
- "scan-pipeline",
- "scan-profiles",
- "scan-sane",
- "serde",
- "serde_json",
- "tempfile",
- "toml",
 ]
 
 [[package]]

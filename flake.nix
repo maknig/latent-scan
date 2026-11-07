@@ -31,7 +31,7 @@
           ];
         in
         {
-          # sane-backends provides `scanimage`, which scan-sane drives.
+          # sane-backends provides `scanimage`, which latent-scan-sane drives.
           default = pkgs.mkShell ({
             buildInputs = [ rust pkgs.pkg-config pkgs.sane-backends ];
           } // pkgs.lib.optionalAttrs isLinux {
