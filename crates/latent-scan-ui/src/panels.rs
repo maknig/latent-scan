@@ -617,14 +617,26 @@ impl ScanUi {
         let aspect = (aw / ah.max(1e-6)) as f32;
         let (tex, area, dpi) = (p.tex.id(), p.area, p.dpi);
         let (frames, active, rotate) = (&self.frames, self.active, self.rotate);
-        let canvas = canvas::show(ui, avail, tex, aspect, &mut self.zoom, |zoom, shape| {
-            view::follow_frame(zoom, frames, active, rotate, shape);
-        });
+        // The frames own the primary drag; hold Space or Ctrl to grab the picture with it instead
+        // (the middle and right buttons always do).
+        let panning = ui.input(|i| i.modifiers.command || i.key_down(egui::Key::Space));
+        let canvas = canvas::show(
+            ui,
+            avail,
+            tex,
+            aspect,
+            &mut self.zoom,
+            panning,
+            |zoom, shape| {
+                view::follow_frame(zoom, frames, active, rotate, shape);
+            },
+        );
         let (rect, resp, window) = (canvas.rect, canvas.resp, canvas.window);
         // Frames live in bed coordinates; they are edited on the turned picture.
         let rot = self.rotate;
         let mut view: Vec<_> = self.frames.iter().map(|c| crop::to_view(*c, rot)).collect();
         let before = view.clone();
+        let active_before = self.active;
         crop::overlay(
             ui,
             &resp,
@@ -635,7 +647,19 @@ impl ScanUi {
             &mut self.grab,
             ACCENT,
         );
-        if view != before {
+        if panning {
+            // The drag moved the picture: the frames stay as they were.
+            self.active = active_before;
+            self.grab = None;
+            if resp.hovered() && self.zoom.is_some() {
+                let icon = if resp.dragged() {
+                    egui::CursorIcon::Grabbing
+                } else {
+                    egui::CursorIcon::Grab
+                };
+                ui.ctx().set_cursor_icon(icon);
+            }
+        } else if view != before {
             self.frames = view.iter().map(|c| crop::from_view(*c, rot)).collect();
         }
         let c = frames::crop_to_mm(area, self.frames[self.active.min(self.frames.len() - 1)]);

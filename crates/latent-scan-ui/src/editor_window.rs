@@ -1,415 +1,34 @@
-//! The image view of a saved scan: adjust, sharpen, rotate and crop with a live histogram,
-//! modelled on the image view of latent.
+//! The image editor window of latent-scan over a list of saved scans: adjust, sharpen, rotate,
+//! crop and remove dust with a live histogram, modelled on the image view of latent.
 //!
-//! Edits only change the preview. **Apply** writes them to the file (at full resolution, same
-//! format, 16 bit kept); the untouched original can be saved first with **Backup original**
-//! (`.originals/…`, latent's layout, see [`crate::edit`]).
+//! The editing state, the render thread and the file operations are latent's
+//! (`latent_image_edit_ui::editor`); this is the window around them. Edits only change the
+//! preview. **Apply** writes them to the file (at full resolution, same format, 16 bit kept);
+//! the untouched original can be saved first with **Backup original** (`.originals/…`).
 
-use crate::crop::{self, Crop, Grab};
-use crate::dust;
-use crate::form::{button_row, form, form_buttons, Btn};
-use crate::histogram::{self, Histogram};
-use crate::presets::PresetUi;
-use crate::preview::{self, rotate_image, to_color_image};
-use crate::sliders::{adjust_groups, preset_row};
-use crate::view::{self, ZoomState};
-use crate::{canvas, edit, ACCENT};
-use egui::{Color32, ColorImage, Context, RichText, TextureHandle, Ui};
-use latent_image_edit::clarity::{clarity, Clarity, ClarityStage};
-use latent_image_edit::heal::{heal, Spot};
-use latent_image_edit::sharpen::{sharpen, Sharpen, SharpenStage};
-use latent_image_edit::tone::{Adjust, Tone, ToneOptions, ToneStage};
+use egui::{Color32, Context, RichText, Ui};
+use latent_image_edit::clarity::Clarity;
+use latent_image_edit::sharpen::Sharpen;
+use latent_image_edit::tone::Adjust;
+use latent_image_edit::BitDepth;
 use latent_image_edit::RawImage;
-use latent_image_edit::{file_depth, read_image, write_image_depth, BitDepth, Pipeline, Rotate};
+use latent_image_edit_ui::crop::{self};
+use latent_image_edit_ui::dust;
+use latent_image_edit_ui::editor::{
+    auto_levels, decode, run_op, EditorOp, EditorState, Edits, Loaded,
+};
+use latent_image_edit_ui::form::{button_row, form, form_buttons, Btn};
+use latent_image_edit_ui::histogram;
+use latent_image_edit_ui::presets::PresetUi;
+use latent_image_edit_ui::sliders::{adjust_groups, preset_row};
+use latent_image_edit_ui::view;
+use latent_image_edit_ui::{canvas, edit, ACCENT};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
 
-/// Longest side of the preview decoded for the editor.
-pub const PREVIEW_SIDE: u32 = 2048;
 /// Width of the side column with the histogram and the sliders.
 const SIDE_W: f32 = 300.0;
 const HISTOGRAM_H: f32 = 100.0;
-
-/// What the user changed and has not applied yet.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Edits {
-    /// Invert and balance a negative.
-    pub negative: bool,
-    pub adjust: Adjust,
-    pub clarity: Clarity,
-    pub sharpen: Sharpen,
-    /// Clockwise quarter turns.
-    pub turns: u8,
-    /// Crop, normalized in the file's own orientation (before the turns).
-    pub crop: Option<Crop>,
-    /// Dust spots to heal, in the file's own orientation (see [`crate::dust`]).
-    pub spots: Vec<Spot>,
-    /// Write the file with 8 instead of 16 bits per sample (an 8-bit file stays 8 bit).
-    pub eight_bit: bool,
-}
-
-impl Edits {
-    /// Nothing that would change the file (a full-size crop or a radius change without
-    /// sharpening counts as nothing).
-    pub fn is_neutral(&self) -> bool {
-        !self.negative
-            && self.adjust.is_neutral()
-            && self.clarity.is_neutral()
-            && self.sharpen.is_neutral()
-            && self.turns.is_multiple_of(4)
-            && self.crop.is_none_or(|c| c == crop::FULL)
-            && self.spots.is_empty()
-            && !self.eight_bit
-    }
-
-    pub fn degrees(&self) -> u16 {
-        (self.turns % 4) as u16 * 90
-    }
-
-    pub fn tone(&self) -> ToneOptions {
-        ToneOptions {
-            negative: self.negative,
-            auto_levels: false,
-            adjust: self.adjust,
-        }
-    }
-
-    /// The part of the edits that decides how the preview looks. The crop only matters while
-    /// the negative base is estimated from it, so dragging the crop of a positive does not
-    /// re-render the picture.
-    fn render_key(&self) -> Self {
-        Self {
-            crop: self.crop.filter(|_| self.negative),
-            sharpen: if self.sharpen.is_neutral() {
-                Sharpen::default()
-            } else {
-                self.sharpen
-            },
-            eight_bit: false,
-            ..self.clone()
-        }
-    }
-}
-
-/// TIFF, PNG and JPEG can be edited and written back. JPEG stays 8 bit and is re-compressed by
-/// every Apply.
-pub fn is_editable(path: &Path) -> bool {
-    path.extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .is_some_and(|e| matches!(e.as_str(), "tif" | "tiff" | "png" | "jpg" | "jpeg"))
-}
-
-/// The edited preview (without the crop, which is an overlay until it is applied). `scale` is the
-/// preview's size relative to the file, so the sharpening radius matches the final result.
-pub fn render(base: &RawImage, edits: &Edits, scale: f32) -> ColorImage {
-    let mut img = base.clone();
-    let tone = edits.tone();
-    if !tone.is_identity() {
-        // The negative base comes from the crop, as it will when applied.
-        let reference = edits.crop.and_then(|c| preview::region(base, c));
-        Tone::estimate(reference.as_ref().unwrap_or(base), tone).apply(&mut img);
-    }
-    clarity(&mut img, edits.clarity);
-    sharpen(&mut img, edits.sharpen.scaled(scale));
-    rotate_image(&to_color_image(&img, u32::MAX), edits.degrees())
-}
-
-/// Black and white point measured on the crop (or the whole preview).
-pub fn auto_levels(base: &RawImage, edits: &Edits) -> Adjust {
-    let reference = edits.crop.and_then(|c| preview::region(base, c));
-    Adjust::auto_levels(reference.as_ref().unwrap_or(base), edits.negative)
-}
-
-/// Applies `edits` to the file at full resolution: heal dust, crop, rotate, tone, clarity, sharpen, written over
-/// the file atomically in the same format. Returns the image that was written.
-pub fn apply_file(path: &Path, edits: &Edits) -> Result<RawImage, String> {
-    let depth = if edits.eight_bit || file_depth(path) == Some(BitDepth::Eight) {
-        BitDepth::Eight
-    } else {
-        BitDepth::Sixteen
-    };
-    let mut img = read_image(path).map_err(|e| e.to_string())?;
-    // Healing comes first: the spots are in the file's own orientation and pixels.
-    heal(&mut img, &edits.spots);
-    if let Some(c) = edits.crop.filter(|c| *c != crop::FULL) {
-        img = preview::region(&img, c).ok_or("the crop is empty")?;
-    }
-    let pipeline = Pipeline::default()
-        .with(Rotate(edits.degrees()))
-        .with(ToneStage(edits.tone()))
-        .with(ClarityStage(edits.clarity))
-        .with(SharpenStage(edits.sharpen));
-    let out = pipeline.run(img).map_err(|e| e.to_string())?;
-    edit::overwrite_atomic(path, |tmp| {
-        write_image_depth(&out, tmp, depth).map_err(|e| e.to_string())
-    })?;
-    Ok(out)
-}
-
-/// What a background file operation of the editor does.
-#[derive(Debug, Clone, PartialEq)]
-pub enum EditorOp {
-    Apply { edits: Edits, backup_first: bool },
-    Backup,
-    Restore,
-}
-
-impl EditorOp {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Apply { .. } => "Apply",
-            Self::Backup => "Backup",
-            Self::Restore => "Restore",
-        }
-    }
-}
-
-/// One image open in the editor.
-pub struct EditorState {
-    pub rel: String,
-    pub path: PathBuf,
-    /// The decoded preview (16 bit, at most [`PREVIEW_SIDE`] long); `None` while loading.
-    pub base: Option<Arc<RawImage>>,
-    pub file_size: [u32; 2],
-    /// Preview size relative to the file.
-    pub scale: f32,
-    pub tex: Option<TextureHandle>,
-    shown: Option<Edits>,
-    pub histogram: Histogram,
-    pub edits: Edits,
-    pub zoom: Option<ZoomState>,
-    /// The pane's shape of the last frame (for the zoom buttons).
-    pub shape: f32,
-    pub grab: Option<Grab>,
-    /// Dust mode: dragging over the picture marks spots; the brush radius is a fraction of the
-    /// picture's width.
-    pub dust: bool,
-    pub brush: f32,
-    /// The pointer is down in dust mode: the preview waits until the spot list is complete.
-    painting: bool,
-    renderer: Option<Renderer>,
-    /// The edits the render thread is working on.
-    requested: Option<Edits>,
-    /// Counts loaded pictures, so a late preview of an older one is ignored.
-    generation: u64,
-    pub editable: bool,
-    pub has_original: bool,
-    /// Bits per sample of the file on disk.
-    pub source_depth: BitDepth,
-    /// Asking whether to overwrite without a backup.
-    pub confirm: bool,
-    pub busy: Option<&'static str>,
-    pub error: Option<String>,
-}
-
-impl EditorState {
-    pub fn new(root: &Path, rel: &str) -> Self {
-        let path = root.join(rel);
-        Self {
-            rel: rel.to_string(),
-            editable: is_editable(&path),
-            has_original: edit::has_original(root, &path),
-            source_depth: file_depth(&path).unwrap_or_default(),
-            path,
-            base: None,
-            file_size: [0, 0],
-            scale: 1.0,
-            tex: None,
-            shown: None,
-            histogram: Histogram::default(),
-            edits: Edits::default(),
-            zoom: None,
-            shape: 1.0,
-            grab: None,
-            dust: false,
-            brush: dust::DEFAULT_BRUSH,
-            painting: false,
-            renderer: None,
-            requested: None,
-            generation: 0,
-            confirm: false,
-            busy: None,
-            error: None,
-        }
-    }
-
-    pub fn dirty(&self) -> bool {
-        !self.edits.is_neutral()
-    }
-
-    /// The decoded preview arrived.
-    pub fn loaded(&mut self, preview: RawImage, file_size: [u32; 2]) {
-        self.scale = preview.width as f32 / file_size[0].max(1) as f32;
-        self.file_size = file_size;
-        self.base = Some(Arc::new(preview));
-        self.shown = None;
-        self.requested = None;
-        self.generation += 1;
-        self.busy = None;
-        self.error = None;
-    }
-
-    /// Back to the file as it is (after an apply or a restore): the preview is decoded again.
-    pub fn reset_for_reload(&mut self, root: &Path) {
-        self.edits = Edits::default();
-        self.dust = false;
-        self.base = None;
-        self.shown = None;
-        self.requested = None;
-        self.generation += 1;
-        self.confirm = false;
-        self.has_original = edit::has_original(root, &self.path);
-        self.source_depth = file_depth(&self.path).unwrap_or_default();
-    }
-
-    /// The preview as displayed: `(width, height)` of the picture after the turns.
-    pub fn picture_size(&self) -> Option<[f32; 2]> {
-        let b = self.base.as_ref()?;
-        let (w, h) = (b.width as f32, b.height as f32);
-        Some(if self.edits.turns.is_multiple_of(2) {
-            [w, h]
-        } else {
-            [h, w]
-        })
-    }
-
-    /// Asks the render thread for a new preview when the edits changed what is shown, and
-    /// shows the ones that are ready.
-    pub fn refresh(&mut self, ctx: &Context) {
-        self.take_rendered(ctx);
-        if self.grab.is_some() || self.painting {
-            return;
-        }
-        let Some(base) = &self.base else { return };
-        let key = self.edits.render_key();
-        if self.shown.as_ref() == Some(&key) || self.requested.as_ref() == Some(&key) {
-            return;
-        }
-        let job = RenderJob {
-            generation: self.generation,
-            key: key.clone(),
-            base: base.clone(),
-            scale: self.scale,
-        };
-        let renderer = self.renderer.get_or_insert_with(|| Renderer::new(ctx));
-        if renderer.tx.send(job).is_ok() {
-            self.requested = Some(key);
-        }
-    }
-
-    /// A preview is on its way.
-    pub fn rendering(&self) -> bool {
-        self.requested.is_some()
-    }
-
-    /// Uploads the previews the render thread finished (the newest one wins).
-    fn take_rendered(&mut self, ctx: &Context) {
-        let Some(renderer) = &self.renderer else {
-            return;
-        };
-        while let Ok(out) = renderer.rx.try_recv() {
-            if out.generation != self.generation || self.requested.as_ref() != Some(&out.key) {
-                continue;
-            }
-            self.histogram = out.histogram;
-            match &mut self.tex {
-                Some(tex) => tex.set(out.image, Default::default()),
-                None => {
-                    self.tex = Some(ctx.load_texture(
-                        format!("editor:{}", self.rel),
-                        out.image,
-                        Default::default(),
-                    ))
-                }
-            }
-            self.shown = Some(out.key);
-            self.requested = None;
-        }
-    }
-}
-
-/// What the render thread is asked to make: the preview for one set of edits.
-struct RenderJob {
-    /// Which loaded picture the job belongs to (a reload starts a new one).
-    generation: u64,
-    key: Edits,
-    base: Arc<RawImage>,
-    scale: f32,
-}
-
-/// The finished preview.
-struct Rendered {
-    generation: u64,
-    key: Edits,
-    image: ColorImage,
-    histogram: Histogram,
-}
-
-/// Renders the preview on its own thread so a slider drag never blocks the window. Only the
-/// newest request is rendered; older ones that are still waiting are dropped.
-struct Renderer {
-    tx: Sender<RenderJob>,
-    rx: Receiver<Rendered>,
-}
-
-impl Renderer {
-    fn new(ctx: &Context) -> Self {
-        let (tx, jobs) = channel::<RenderJob>();
-        let (done, rx) = channel();
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let mut healed = HealCache::default();
-            while let Ok(mut job) = jobs.recv() {
-                while let Ok(newer) = jobs.try_recv() {
-                    job = newer;
-                }
-                let out =
-                    crate::trace::timed("editor preview render", || render_job(job, &mut healed));
-                if done.send(out).is_err() {
-                    break;
-                }
-                ctx.request_repaint();
-            }
-        });
-        Self { tx, rx }
-    }
-}
-
-/// The preview base with the spots healed, for the picture and spots it was made for.
-#[derive(Default)]
-struct HealCache(Option<(Arc<RawImage>, Vec<Spot>, RawImage)>);
-
-impl HealCache {
-    fn base<'a>(&'a mut self, base: &'a Arc<RawImage>, spots: &[Spot]) -> &'a RawImage {
-        if spots.is_empty() {
-            return base;
-        }
-        let fresh = self
-            .0
-            .as_ref()
-            .is_some_and(|(b, s, _)| Arc::ptr_eq(b, base) && s == spots);
-        if !fresh {
-            // Healing searches for texture, so it only runs when the spots changed.
-            let mut img = (**base).clone();
-            heal(&mut img, spots);
-            self.0 = Some((base.clone(), spots.to_vec(), img));
-        }
-        &self.0.as_ref().expect("just made").2
-    }
-}
-
-/// The work of the render thread for one job.
-fn render_job(job: RenderJob, healed: &mut HealCache) -> Rendered {
-    let base = healed.base(&job.base, &job.key.spots);
-    let image = render(base, &job.key, job.scale);
-    Rendered {
-        generation: job.generation,
-        histogram: Histogram::of(&image),
-        key: job.key,
-        image,
-    }
-}
 
 /// Things the user asked for in one frame; run after the windows are drawn.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -452,7 +71,7 @@ pub enum EditorEvent {
 enum Msg {
     Loaded {
         path: PathBuf,
-        result: Result<(RawImage, [u32; 2]), String>,
+        result: Result<Loaded, String>,
     },
     Done {
         path: PathBuf,
@@ -474,15 +93,10 @@ impl Reporter {
     }
 }
 
-/// Decodes the file on a thread: the preview (at most [`PREVIEW_SIDE`]) and the file's size.
+/// Decodes the file on a thread: the preview, the file's size and the levels for the sharp part.
 fn load(r: Reporter, path: PathBuf) {
     std::thread::spawn(move || {
-        let result = read_image(&path)
-            .map(|full| {
-                let size = [full.width, full.height];
-                (preview::downscale(&full, PREVIEW_SIDE), size)
-            })
-            .map_err(|e| format!("cannot read {}: {e}", path.display()));
+        let result = decode(&path);
         r.send(Msg::Loaded { path, result });
     });
 }
@@ -494,23 +108,6 @@ fn spawn_op(r: Reporter, root: PathBuf, path: PathBuf, op: EditorOp) {
         let result = run_op(&root, &path, op);
         r.send(Msg::Done { path, what, result });
     });
-}
-
-/// The work of an [`EditorOp`], on the calling thread. An apply returns the written image.
-fn run_op(root: &Path, path: &Path, op: EditorOp) -> Result<Option<RawImage>, String> {
-    match op {
-        EditorOp::Backup => edit::backup_original(root, path).map(|()| None),
-        EditorOp::Restore => edit::restore_original(root, path).map(|()| None),
-        EditorOp::Apply {
-            edits,
-            backup_first,
-        } => {
-            if backup_first {
-                edit::backup_original(root, path)?;
-            }
-            apply_file(path, &edits).map(Some)
-        }
-    }
 }
 
 /// The image editor window over a list of files. The host owns it, calls [`Editor::sync`] to say
@@ -544,10 +141,6 @@ impl Editor {
             tx,
             rx,
         }
-    }
-
-    pub fn is_open(&self) -> bool {
-        self.state.is_some()
     }
 
     /// Path (relative to the root) of the open file.
@@ -605,7 +198,7 @@ impl Editor {
                 Msg::Loaded { path, result } => {
                     if let Some(e) = self.state.as_mut().filter(|e| e.path == path) {
                         match result {
-                            Ok((preview, size)) => e.loaded(preview, size),
+                            Ok(l) => e.loaded_from(l),
                             Err(msg) => {
                                 e.busy = None;
                                 e.error = Some(msg);
@@ -959,10 +552,12 @@ fn toolbar(ui: &mut Ui, st: &EditorState, n: usize, last: usize, acts: &mut Vec<
             if ui.add_enabled(marked, egui::Button::new("Undo")).clicked() {
                 acts.push(Act::UndoSpot);
             }
+            // A fixed width: the count growing a digit must not rewrap the toolbar.
             if ui
                 .add_enabled(
                     marked,
-                    egui::Button::new(format!("Clear ({})", st.edits.spots.len())),
+                    egui::Button::new(format!("Clear ({})", st.edits.spots.len()))
+                        .min_size(egui::vec2(88.0, 0.0)),
                 )
                 .clicked()
             {
@@ -1024,8 +619,18 @@ fn image_area(ui: &mut Ui, st: &mut EditorState, pane: egui::Vec2) {
         return;
     };
     let aspect = w / h.max(1.0);
-    let canvas = canvas::show(ui, pane, tex, aspect, &mut st.zoom, |_, _| {});
+    // The crop frame and the dust brush own the primary drag; without them it grabs the picture.
+    let tool = st.edits.crop.is_some() || st.dust;
+    let canvas = canvas::show(ui, pane, tex, aspect, &mut st.zoom, !tool, |_, _| {});
     st.shape = canvas.shape;
+    if !tool {
+        if canvas.resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if canvas.resp.hovered() && st.zoom.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+    }
+    st.show_detail(ui, canvas.rect, canvas.window);
     // The crop is stored in the file's orientation and edited on the turned picture.
     if let Some(c) = st.edits.crop {
         let deg = st.edits.degrees();
@@ -1091,7 +696,16 @@ fn side_column(ui: &mut Ui, st: &mut EditorState, presets: &mut PresetUi, acts: 
     if !st.editable {
         state.push("view only (TIFF and PNG can be edited)".into());
     }
-    ui.weak(state.join(" · "));
+    // A block of two lines whatever the text: a click changes it ("rendering…", "n dust
+    // spots"), and a line that wraps would grow the window and move the picture.
+    let text = state.join(" · ");
+    let line = ui.text_style_height(&egui::TextStyle::Body);
+    let (block, _) = ui.allocate_exact_size(egui::vec2(SIDE_W, 2.0 * line), egui::Sense::hover());
+    let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(block));
+    inner.set_clip_rect(block.intersect(ui.clip_rect()));
+    inner
+        .add(egui::Label::new(RichText::new(&text).weak()).wrap())
+        .on_hover_text(&text);
     ui.add_space(4.0);
 
     let colour = st.base.as_ref().is_none_or(|b| b.channels == 3);
@@ -1164,7 +778,11 @@ fn side_column(ui: &mut Ui, st: &mut EditorState, presets: &mut PresetUi, acts: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use latent_image_edit::heal::Spot;
     use latent_image_edit::write_image;
+    use latent_image_edit::{file_depth, read_image};
+    use latent_image_edit_ui::editor::{apply_file, is_editable};
+    use latent_image_edit_ui::view::ZoomState;
 
     fn dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("scan-editor-{name}-{}", std::process::id()));
@@ -1183,321 +801,6 @@ mod tests {
         }
         write_image(&RawImage::new(w, h, 3, data).unwrap(), path).unwrap();
     }
-
-    #[test]
-    fn nothing_is_pending_until_something_changes() {
-        assert!(Edits::default().is_neutral());
-        let changed = [
-            Edits {
-                negative: true,
-                ..Edits::default()
-            },
-            Edits {
-                turns: 1,
-                ..Edits::default()
-            },
-            Edits {
-                crop: Some([0.1, 0.1, 0.9, 0.9]),
-                ..Edits::default()
-            },
-            Edits {
-                adjust: Adjust {
-                    exposure_ev: 0.5,
-                    ..Adjust::default()
-                },
-                ..Edits::default()
-            },
-            Edits {
-                sharpen: Sharpen {
-                    amount: 1.0,
-                    radius: 1.0,
-                },
-                ..Edits::default()
-            },
-        ];
-        assert!(changed.iter().all(|e| !e.is_neutral()));
-        // These change nothing in the file.
-        assert!(Edits {
-            turns: 4,
-            ..Edits::default()
-        }
-        .is_neutral());
-        assert!(Edits {
-            crop: Some(crop::FULL),
-            ..Edits::default()
-        }
-        .is_neutral());
-        assert!(Edits {
-            sharpen: Sharpen {
-                amount: 0.0,
-                radius: 3.0
-            },
-            ..Edits::default()
-        }
-        .is_neutral());
-    }
-
-    #[test]
-    fn only_tiff_png_and_jpeg_are_editable() {
-        for ok in ["a.tiff", "a.TIF", "b.png", "c.PNG", "d.jpg", "e.JPEG"] {
-            assert!(is_editable(Path::new(ok)), "{ok}");
-        }
-        for no in ["a.gif", "a", "a.txt"] {
-            assert!(!is_editable(Path::new(no)), "{no}");
-        }
-    }
-
-    #[test]
-    fn the_preview_applies_tone_rotation_and_leaves_the_crop_as_an_overlay() {
-        let base = RawImage::new(4, 2, 1, vec![0, 16384, 32768, 65535, 0, 0, 0, 0]).unwrap();
-        let plain = render(&base, &Edits::default(), 1.0);
-        assert_eq!(plain.size, [4, 2]);
-
-        let turned = render(
-            &base,
-            &Edits {
-                turns: 1,
-                ..Edits::default()
-            },
-            1.0,
-        );
-        assert_eq!(turned.size, [2, 4], "a quarter turn swaps width and height");
-
-        let brighter = Edits {
-            adjust: Adjust {
-                exposure_ev: 1.0,
-                ..Adjust::default()
-            },
-            ..Edits::default()
-        };
-        let lit = render(&base, &brighter, 1.0);
-        assert!(
-            lit.pixels[1].r() > plain.pixels[1].r(),
-            "exposure brightens"
-        );
-
-        let cropped = render(
-            &base,
-            &Edits {
-                crop: Some([0.0, 0.0, 0.5, 0.5]),
-                ..Edits::default()
-            },
-            1.0,
-        );
-        assert_eq!(
-            cropped.size,
-            [4, 2],
-            "the crop is not applied to the preview"
-        );
-    }
-
-    #[test]
-    fn dragging_the_crop_of_a_positive_does_not_re_render_the_picture() {
-        let a = Edits {
-            crop: Some([0.1, 0.1, 0.5, 0.5]),
-            ..Edits::default()
-        };
-        let b = Edits {
-            crop: Some([0.2, 0.2, 0.6, 0.6]),
-            ..Edits::default()
-        };
-        assert_eq!(a.render_key(), b.render_key());
-        // A negative takes its base from the crop, so there it does.
-        let (na, nb) = (
-            Edits {
-                negative: true,
-                ..a
-            },
-            Edits {
-                negative: true,
-                ..b
-            },
-        );
-        assert_ne!(na.render_key(), nb.render_key());
-        // The radius of an off sharpening does not matter either.
-        let r = Edits {
-            sharpen: Sharpen {
-                amount: 0.0,
-                radius: 4.0,
-            },
-            ..Edits::default()
-        };
-        assert_eq!(r.render_key(), Edits::default().render_key());
-    }
-
-    #[test]
-    fn auto_levels_come_from_the_crop_when_there_is_one() {
-        // A dark ramp on the left, a bright ramp on the right (a flat area would give no range).
-        let mut data = vec![];
-        for _ in 0..10 {
-            data.extend((0..5).map(|i| 10000u16 + i * 1000));
-            data.extend((0..5).map(|i| 40000u16 + i * 2000));
-        }
-        let base = RawImage::new(10, 10, 1, data).unwrap();
-        let whole = auto_levels(&base, &Edits::default());
-        let right_half = auto_levels(
-            &base,
-            &Edits {
-                crop: Some([0.5, 0.0, 1.0, 1.0]),
-                ..Edits::default()
-            },
-        );
-        assert!(
-            right_half.black > whole.black,
-            "{right_half:?} vs {whole:?}"
-        );
-    }
-
-    #[test]
-    fn applying_crops_rotates_and_tones_the_file_and_keeps_16_bits() {
-        let d = dir("apply");
-        let file = d.join("scan.tiff");
-        write_scan(&file, 40, 20);
-        let edits = Edits {
-            crop: Some([0.5, 0.0, 1.0, 1.0]), // the bright right half: 20 x 20
-            turns: 1,
-            adjust: Adjust {
-                exposure_ev: -1.0,
-                ..Adjust::default()
-            },
-            ..Edits::default()
-        };
-        let written = apply_file(&file, &edits).unwrap();
-        let back = read_image(&file).unwrap();
-        assert_eq!(back, written, "what was returned is what is on disk");
-        assert_eq!((back.width, back.height, back.channels), (20, 20, 3));
-        // The right half (40000) lost one stop: about 20000, in full 16-bit precision.
-        assert!(
-            back.data.iter().all(|&v| (v as i32 - 20000).abs() <= 2),
-            "{:?}",
-            &back.data[..6]
-        );
-        std::fs::remove_dir_all(d).ok();
-    }
-
-    #[test]
-    fn rotation_alone_turns_the_picture_clockwise_on_disk() {
-        let d = dir("turn");
-        let file = d.join("t.png");
-        write_scan(&file, 40, 20);
-        apply_file(
-            &file,
-            &Edits {
-                turns: 1,
-                ..Edits::default()
-            },
-        )
-        .unwrap();
-        let back = read_image(&file).unwrap();
-        assert_eq!((back.width, back.height), (20, 40));
-        // The dark left half is now the top half.
-        assert_eq!(back.data[0], 10000);
-        assert_eq!(*back.data.last().unwrap(), 40000);
-        std::fs::remove_dir_all(d).ok();
-    }
-
-    #[test]
-    fn sharpening_is_applied_last_to_the_full_resolution_file() {
-        let d = dir("sharp");
-        let file = d.join("s.tiff");
-        write_scan(&file, 60, 10);
-        let edits = Edits {
-            sharpen: Sharpen {
-                amount: 1.5,
-                radius: 2.0,
-            },
-            ..Edits::default()
-        };
-        apply_file(&file, &edits).unwrap();
-        let back = read_image(&file).unwrap();
-        assert_eq!((back.width, back.height), (60, 10));
-        let at = |x: usize| back.data[3 * x];
-        assert!(
-            at(29) < 10000 && at(30) > 40000,
-            "overshoot at the edge: {} {}",
-            at(29),
-            at(30)
-        );
-        std::fs::remove_dir_all(d).ok();
-    }
-
-    #[test]
-    fn a_failed_apply_leaves_the_file_alone() {
-        let d = dir("fail");
-        let file = d.join("bad.tiff");
-        std::fs::write(&file, b"not an image").unwrap();
-        assert!(apply_file(
-            &file,
-            &Edits {
-                turns: 1,
-                ..Edits::default()
-            }
-        )
-        .is_err());
-        assert_eq!(std::fs::read(&file).unwrap(), b"not an image");
-        std::fs::remove_dir_all(d).ok();
-    }
-
-    #[test]
-    fn an_empty_crop_is_refused_without_touching_the_file() {
-        let d = dir("empty");
-        let file = d.join("e.png");
-        write_scan(&file, 10, 10);
-        let before = std::fs::read(&file).unwrap();
-        // A crop of one pixel is still valid; a crop outside the image clamps to one pixel.
-        let ok = apply_file(
-            &file,
-            &Edits {
-                crop: Some([0.9, 0.9, 1.0, 1.0]),
-                ..Edits::default()
-            },
-        )
-        .unwrap();
-        assert!(ok.width >= 1 && ok.height >= 1);
-        assert_ne!(std::fs::read(&file).unwrap(), before);
-        std::fs::remove_dir_all(d).ok();
-    }
-
-    #[test]
-    fn a_new_editor_state_knows_about_formats_and_backups() {
-        let d = dir("state");
-        let file = d.join("images/roll/0001/x.tiff");
-        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        write_scan(&file, 8, 8);
-        let st = EditorState::new(&d, "images/roll/0001/x.tiff");
-        assert!(st.editable && !st.has_original && !st.dirty() && st.base.is_none());
-
-        edit::backup_original(&d, &file).unwrap();
-        assert!(EditorState::new(&d, "images/roll/0001/x.tiff").has_original);
-        assert!(!EditorState::new(&d, "images/roll/0001/y.gif").editable);
-        std::fs::remove_dir_all(d).ok();
-    }
-
-    #[test]
-    fn loading_sets_the_scale_and_reloading_clears_the_edits() {
-        let d = dir("load");
-        let mut st = EditorState::new(&d, "a.png");
-        st.edits.negative = true;
-        st.busy = Some("Applying");
-        st.loaded(
-            RawImage::new(100, 50, 1, vec![0; 5000]).unwrap(),
-            [400, 200],
-        );
-        assert_eq!(st.scale, 0.25);
-        assert!(
-            st.busy.is_none() && st.dirty(),
-            "edits survive a load (only apply resets them)"
-        );
-        assert_eq!(st.picture_size(), Some([100.0, 50.0]));
-        st.edits.turns = 1;
-        assert_eq!(st.picture_size(), Some([50.0, 100.0]));
-
-        st.confirm = true;
-        st.reset_for_reload(&d);
-        assert!(!st.dirty() && st.base.is_none() && !st.confirm);
-        std::fs::remove_dir_all(d).ok();
-    }
-
     /// A `Editor` on an archive with one TIFF open in the editor, with a loaded preview.
     fn ui_with_open_image(name: &str) -> (Editor, PathBuf, PathBuf) {
         let root = dir(name);
@@ -1669,62 +972,6 @@ mod tests {
     }
 
     #[test]
-    fn the_preview_shows_healed_spots_and_caches_them() {
-        let (mut ui, root, _file) = ui_with_open_image("dust-preview");
-        let ctx = Context::default();
-        let st = ui.state.as_mut().unwrap();
-        let mut base = RawImage::new(60, 40, 3, vec![20000; 60 * 40 * 3]).unwrap();
-        for c in 0..3 {
-            base.data[(20 * 60 + 30) * 3 + c] = 65535;
-        }
-        st.loaded(base, [60, 40]);
-        st.edits.spots.push(Spot {
-            x: 0.5,
-            y: 0.5,
-            r: 3.0 / 60.0,
-        });
-        let spots = st.edits.spots.clone();
-        let base = st.base.clone().unwrap();
-        let mut cache = HealCache::default();
-        let healed = cache.base(&base, &spots) as *const RawImage;
-        assert_eq!(unsafe { &*healed }.data[(20 * 60 + 30) * 3], 20000);
-        assert!(
-            std::ptr::eq(healed, cache.base(&base, &spots)),
-            "the healed copy is reused for the same spots"
-        );
-        // Through the render thread the same preview ends up in the texture.
-        settle(st, &ctx);
-        assert!(st.tex.is_some() && !st.rendering());
-        assert_eq!(st.base.as_ref().unwrap().data[(20 * 60 + 30) * 3], 65535);
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn a_burst_of_edits_ends_with_the_newest_preview() {
-        let (mut ui, root, _file) = ui_with_open_image("burst");
-        let ctx = Context::default();
-        let st = ui.state.as_mut().unwrap();
-        for step in 1..=8 {
-            st.edits.adjust.exposure_ev = step as f32 * 0.1;
-            st.refresh(&ctx);
-        }
-        settle(st, &ctx);
-        let want = st.edits.render_key();
-        assert_eq!(
-            st.shown.as_ref(),
-            Some(&want),
-            "the last request is what is shown"
-        );
-        assert!(st.tex.is_some());
-        // A late answer for an older picture is ignored.
-        let generation = st.generation;
-        st.loaded(RawImage::new(2, 2, 1, vec![1000; 4]).unwrap(), [4, 4]);
-        assert_eq!(st.generation, generation + 1);
-        assert!(st.shown.is_none() && !st.rendering());
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
     fn dust_mode_draws_with_spots_on_a_turned_picture() {
         let (mut ui, root, _file) = ui_with_open_image("dust-draw");
         let ctx = Context::default();
@@ -1740,6 +987,133 @@ mod tests {
         let st = ui.state.as_ref().unwrap();
         assert!(st.dust && st.tex.is_some() && !st.painting);
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn marking_dust_spots_does_not_move_the_picture() {
+        for (sw, sh) in [(1400.0, 900.0), (1366.0, 768.0), (1024.0, 700.0)] {
+            let (mut ui, root, _file) = ui_with_open_image("no-wiggle");
+            let ctx = Context::default();
+            ui.state.as_mut().unwrap().dust = true;
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(sw, sh));
+            for _ in 0..5 {
+                let input = egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                };
+                let _ = ctx.run(input, |ctx| {
+                    ui.show(ctx, &mut PresetUi::default());
+                });
+            }
+            let area =
+                |ctx: &Context| ctx.memory(|m| m.area_rect(egui::Id::new("latent-image-editor")));
+            let fixed = |ui: &Editor, ctx: &Context| (area(ctx), ui.state.as_ref().unwrap().shape);
+            let before = fixed(&ui, &ctx);
+            assert!(before.0.is_some());
+            // What a click changes: more spots (the "Clear (n)" button, the state line), unsaved
+            // edits, a backup and a render in flight, and a longer state line.
+            for n in 1..=12 {
+                {
+                    let st = ui.state.as_mut().unwrap();
+                    st.edits.spots.push(Spot {
+                        x: (n as f32 * 0.07) % 1.0,
+                        y: 0.5,
+                        r: 0.02,
+                    });
+                    st.has_original = n % 2 == 0;
+                    st.file_size = if n % 3 == 0 { [42000, 30000] } else { [40, 20] };
+                }
+                let input = egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                };
+                // One frame, without waiting for the render: "rendering…" is on.
+                let _ = ctx.run(input, |ctx| {
+                    ui.show(ctx, &mut PresetUi::default());
+                });
+                assert_eq!(fixed(&ui, &ctx), before, "{sw}x{sh}: after {n} spots");
+            }
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+
+    /// Runs one frame of the editor window with the given pointer events.
+    fn frame_with(ui: &mut Editor, ctx: &Context, events: Vec<egui::Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            ui.show(ctx, &mut PresetUi::default());
+        });
+    }
+
+    /// Drags the primary button from `from` by `by` over a few frames.
+    fn drag(ui: &mut Editor, ctx: &Context, from: egui::Pos2, by: egui::Vec2) {
+        use egui::{Event, PointerButton};
+        let button = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame_with(ui, ctx, vec![Event::PointerMoved(from)]);
+        frame_with(ui, ctx, vec![button(from, true)]);
+        for i in 1..=4 {
+            let p = from + by * (i as f32 / 4.0);
+            frame_with(ui, ctx, vec![Event::PointerMoved(p)]);
+        }
+        frame_with(ui, ctx, vec![button(from + by, false)]);
+    }
+
+    /// An editor with a zoomed-in picture and the middle of its pane under the pointer.
+    fn zoomed_editor(name: &str) -> (Editor, Context, PathBuf, egui::Pos2) {
+        let (mut ui, root, _file) = ui_with_open_image(name);
+        let ctx = Context::default();
+        ui.state.as_mut().unwrap().zoom = Some(ZoomState {
+            center: [0.5, 0.5],
+            zoom: 3.0,
+            follow: None,
+        });
+        draw(&mut ui, &ctx, 4);
+        let window = ctx
+            .memory(|m| m.area_rect(egui::Id::new("latent-image-editor")))
+            .expect("the window exists");
+        // Left of the side column, below the toolbar: inside the pane.
+        let pane_middle = egui::pos2(window.left() + 300.0, window.top() + 300.0);
+        (ui, ctx, root, pane_middle)
+    }
+
+    #[test]
+    fn dragging_the_picture_with_the_primary_button_pans_it() {
+        let (mut ui, ctx, root, at) = zoomed_editor("drag-pan");
+        let before = ui.state.as_ref().unwrap().zoom.unwrap().center;
+        drag(&mut ui, &ctx, at, egui::vec2(-120.0, 0.0));
+        let after = ui.state.as_ref().unwrap().zoom.unwrap().center;
+        assert!(after[0] > before[0] + 0.01, "{before:?} -> {after:?}");
+        assert!((after[1] - before[1]).abs() < 1e-3, "only sideways");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn with_the_dust_brush_or_the_crop_the_primary_drag_does_not_pan() {
+        for crop_tool in [false, true] {
+            let (mut ui, ctx, root, at) = zoomed_editor("drag-tool");
+            {
+                let st = ui.state.as_mut().unwrap();
+                st.dust = !crop_tool;
+                st.edits.crop = crop_tool.then_some([0.4, 0.4, 0.6, 0.6]);
+            }
+            let before = ui.state.as_ref().unwrap().zoom.unwrap().center;
+            drag(&mut ui, &ctx, at, egui::vec2(-120.0, 0.0));
+            let st = ui.state.as_ref().unwrap();
+            assert_eq!(st.zoom.unwrap().center, before, "crop tool: {crop_tool}");
+            std::fs::remove_dir_all(root).ok();
+        }
     }
 
     #[test]
@@ -2039,18 +1413,6 @@ mod tests {
             edits: turned(),
             backup_first: false,
         }
-    }
-
-    /// Refreshes until the render thread has delivered what was asked for.
-    fn settle(st: &mut EditorState, ctx: &Context) {
-        for _ in 0..400 {
-            st.refresh(ctx);
-            if !st.rendering() {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        panic!("the preview was never rendered");
     }
 
     /// Runs `frames` headless frames of the editor window.

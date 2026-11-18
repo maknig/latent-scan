@@ -5,6 +5,7 @@
 //! standalone app calls `show_main` instead, which fills the whole window: resizable controls
 //! on the left, the preview on the right and an image strip of the row's scans at the bottom.
 
+mod editor_window;
 mod frames;
 mod offset;
 mod panels;
@@ -148,7 +149,7 @@ pub struct ScanUi {
     thumbs: Option<Thumbs>,
     strip: strip::StripState,
     /// The image open in the editor (double-click on a tile of the strip).
-    editor: latent_image_edit_ui::Editor,
+    editor: editor_window::Editor,
 }
 
 impl ScanUi {
@@ -231,7 +232,7 @@ impl ScanUi {
             status: profile_warning.or(presets_warning).map(|w| (true, w)),
             thumbs: None,
             strip: strip::StripState::default(),
-            editor: latent_image_edit_ui::Editor::new(),
+            editor: editor_window::Editor::new(),
             renderer: None,
             preview_serial: 0,
         }

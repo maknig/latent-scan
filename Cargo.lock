@@ -1844,7 +1844,6 @@ dependencies = [
  "image",
  "latent-image-edit",
  "serde",
- "tempfile",
  "toml",
 ]
 

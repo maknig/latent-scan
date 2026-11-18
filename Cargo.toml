@@ -4,8 +4,6 @@ members = [
     "crates/latent-scan-core",
     "crates/latent-scan-sane",
     "crates/latent-scan-profiles",
-    "crates/latent-image-edit",
-    "crates/latent-image-edit-ui",
     "crates/latent-scan-archive",
     "crates/latent-scan-detect",
     "crates/latent-scan-ui",
@@ -27,8 +25,8 @@ eframe = "0.31"
 latent-scan-core = { path = "crates/latent-scan-core" }
 latent-scan-sane = { path = "crates/latent-scan-sane" }
 latent-scan-profiles = { path = "crates/latent-scan-profiles" }
-latent-image-edit = { path = "crates/latent-image-edit" }
-latent-image-edit-ui = { path = "crates/latent-image-edit-ui" }
+latent-image-edit = { path = "../latent/crates/image-edit" }
+latent-image-edit-ui = { path = "../latent/crates/image-edit-ui" }
 latent-scan-archive = { path = "crates/latent-scan-archive" }
 latent-scan-ui = { path = "crates/latent-scan-ui" }
 latent-scan-detect = { path = "crates/latent-scan-detect" }

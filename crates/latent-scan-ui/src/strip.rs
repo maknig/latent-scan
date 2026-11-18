@@ -32,7 +32,7 @@ pub struct StripState {
 impl ScanUi {
     /// The image editor window; opened by double-clicking a tile of the strip.
     pub(crate) fn editor_window(&mut self, ctx: &egui::Context) {
-        use latent_image_edit_ui::EditorEvent;
+        use crate::editor_window::EditorEvent;
         let Some(n) = self.strip.large.filter(|n| *n < self.strip.paths.len()) else {
             self.strip.large = None;
             self.editor.close();
