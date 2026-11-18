@@ -5,6 +5,7 @@ enlargements). Built to be merged into latent later: crates here become workspac
 
 ## Commands
 - `nix develop` for the toolchain and `scanimage` (sane-backends).
+- `latent-image-edit` and `-ui` are git dependencies on `github.com/maknig/latent` (branch `image-edit-view`; switch to `main` once merged). For a sibling `../latent` checkout copy `.cargo/config.toml.example` to `.cargo/config.toml` (git-ignored `[patch]`); without it a plain clone builds from GitHub.
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets`, `cargo fmt`.
 - `cargo run -p latent-scan-cli -- list | caps | profiles | scan -p <profile> [--archive DIR --table T --id N | -o FILE]`
 - `cargo run -p latent-scan-gui` for the GUI (saves to the folder used last, `~/Pictures/latent-scan` at first); `cargo run -p latent-scan-gui -- <archive>` starts in that latent archive.
